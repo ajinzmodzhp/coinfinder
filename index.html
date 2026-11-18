@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Picture Match Peso Finder</title>
+    <style>
+        body { margin: 0; background: black; color: white; font-family: sans-serif; overflow: hidden; }
+        #container { position: relative; width: 100vw; height: 100vh; }
+        video, canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; }
+        #status { position: absolute; top: 20px; left: 20px; font-size: 24px; font-weight: bold; z-index: 10; background: rgba(0,0,0,0.5); padding: 10px; border-radius: 5px; }
+    </style>
+    <script async src="https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.8.0-release.1/dist/opencv.js" onload="onOpenCvReady();" type="text/javascript"></script>
+</head>
+<body>
+    <div id="container">
+        <div id="status">Loading OpenCV & Reference Image...</div>
+        <video id="video" autoplay playsinline></video>
+        <canvas id="canvas"></canvas>
+    </div>
+
+    <script>
+        // 🔴 PUT YOUR DIRECT IMAGE LINK HERE
+        // You can use a direct link from imgur, or a local file like "20peso.jpg"
+        const REFERENCE_IMAGE_URL = "https://i.imageupload.app/20dd26a0007d6f8d2f0d.jpeg"; 
+
+        let video = document.getElementById('video');
+        let canvas = document.getElementById('canvas');
+        let ctx = canvas.getContext('2d');
+        let statusText = document.getElementById('status');
+        let cvReady = false;
+        let templateReady = false;
+        let templateMat = null;
+
+        let isProcessing = false;
+        let lastDrawTime = 0;
+
+        // 1. Load the reference image into OpenCV
+        function loadReferenceImage() {
+            let img = new Image();
+            img.crossOrigin = "Anonymous"; // Needed to avoid CORS errors
+            img.src = REFERENCE_IMAGE_URL;
+            img.onload = () => {
+                let imgMat = cv.imread(img);
+                
+                // Convert to gray and resize to standard 100x100
+                let gray = new cv.Mat();
+                cv.cvtColor(imgMat, gray, cv.COLOR_RGBA2GRAY);
+                templateMat = new cv.Mat();
+                cv.resize(gray, templateMat, new cv.Size(100, 100), 0, 0, cv.INTER_AREA);
+                
+                // Convert reference to edges
+                cv.Canny(templateMat, templateMat, 50, 150);
+                
+                templateReady = true;
+                statusText.innerText = "Reference loaded! Starting camera...";
+                startCamera();
+                
+                imgMat.delete();
+                gray.delete();
+            };
+            img.onerror = () => {
+                statusText.innerText = "❌ Failed to load reference image URL.";
+            };
+        }
+
+        async function startCamera() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { facingMode: "environment" } 
+                });
+                video.srcObject = stream;
+                video.onloadedmetadata = () => {
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                    processVideo();
+                };
+            } catch (err) {
+                statusText.innerHTML = "🚫 Camera Access Denied. Please allow permissions.";
+            }
+        }
+
+        let src, dst, gray, circles;
+        function processVideo() {
+            if (!cvReady || !templateReady) return;
+
+            src = new cv.Mat(video.videoHeight, video.videoWidth, cv.CV_8UC4);
+            dst = new cv.Mat(video.videoHeight, video.videoWidth, cv.CV_8UC4);
+            gray = new cv.Mat();
+            circles = new cv.Mat();
+
+            function frameLoop(timestamp) {
+                if (video.readyState === video.HAVE_ENOUGH_DATA) {
+                    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+                    if (!isProcessing && (timestamp - lastDrawTime > 150)) {
+                        lastDrawTime = timestamp;
+                        isProcessing = true;
+
+                        src.data.set(ctx.getImageData(0, 0, canvas.width, canvas.height).data);
+                        detectByTemplate();
+                        cv.imshow('canvas', dst);
+                        
+                        isProcessing = false;
+                    }
+                }
+                requestAnimationFrame(frameLoop);
+            }
+            requestAnimationFrame(frameLoop);
+        }
+
+        function detectByTemplate() {
+            src.copyTo(dst); 
+
+            let scale = 0.5;
+            let smallSrc = new cv.Mat();
+            cv.resize(src, smallSrc, new cv.Size(src.cols * scale, src.rows * scale), 0, 0, cv.INTER_AREA);
+
+            let smallGray = new cv.Mat();
+            cv.cvtColor(smallSrc, smallGray, cv.COLOR_RGBA2GRAY);
+            cv.GaussianBlur(smallGray, smallGray, new cv.Size(3, 3), 0, 0, cv.BORDER_DEFAULT);
+
+            // 1. Find Circles (Any size)
+            cv.HoughCircles(smallGray, circles, cv.HOUGH_GRADIENT, 1, smallGray.rows / 8, 100, 22, 5, 200);
+
+            let bestCircle = null;
+            let highestScore = 0;
+
+            // 2. Loop through circles and compare to reference
+            for (let i = 0; i < circles.cols; i++) {
+                let x = circles.data32F[i * 3];
+                let y = circles.data32F[i * 3 + 1];
+                let radius = circles.data32F[i * 3 + 2];
+
+                // Extract and resize the cropped circle to 100x100
+                let roiX = Math.max(0, Math.floor(x - radius));
+                let roiY = Math.max(0, Math.floor(y - radius));
+                let roiW = Math.min(smallGray.cols - roiX, Math.floor(radius * 2));
+                let roiH = Math.min(smallGray.rows - roiY, Math.floor(radius * 2));
+
+                if (roiW > 10 && roiH > 10) {
+                    let roi = smallGray.roi(new cv.Rect(roiX, roiY, roiW, roiH));
+                    let resizedCoin = new cv.Mat();
+                    cv.resize(roi, resizedCoin, new cv.Size(100, 100), 0, 0, cv.INTER_AREA);
+                    
+                    // Convert to edges
+                    let coinEdges = new cv.Mat();
+                    cv.Canny(resizedCoin, coinEdges, 50, 150);
+
+                    // Compare using matchTemplate (TM_CCOEFF_NORMED gives a score between -1 and 1)
+                    let result = new cv.Mat();
+                    cv.matchTemplate(coinEdges, templateMat, result, cv.TM_CCOEFF_NORMED);
+                    
+                    let minMax = cv.minMaxLoc(result);
+                    let score = minMax.maxVal;
+
+                    // If this score is the highest so far, it's the new "King"
+                    if (score > highestScore) {
+                        highestScore = score;
+                        bestCircle = { 
+                            x: x / scale, 
+                            y: y / scale, 
+                            r: radius / scale 
+                        };
+                    }
+
+                    roi.delete();
+                    resizedCoin.delete();
+                    coinEdges.delete();
+                    result.delete();
+                }
+            }
+
+            // 3. Draw if we found a match (Threshold > 0.55 is usually good)
+            // Lower this to 0.45 if it doesn't detect, raise to 0.65 if it detects too much.
+            if (bestCircle && highestScore > 0.55) {
+                statusText.innerText = "✅ 20 PESOS MATCHED (" + Math.round(highestScore * 100) + "%)";
+                cv.circle(dst, new cv.Point(bestCircle.x, bestCircle.y), bestCircle.r, new cv.Scalar(0, 255, 0, 255), 8);
+            } else {
+                statusText.innerText = "🔍 Searching... (" + Math.round(highestScore * 100) + "%)";
+            }
+
+            smallSrc.delete();
+            smallGray.delete();
+        }
+
+        function onOpenCvReady() {
+            cvReady = true;
+            statusText.innerText = "OpenCV Loaded! Downloading reference image...";
+            loadReferenceImage();
+        }
+    </script>
+</body>
+</html>
